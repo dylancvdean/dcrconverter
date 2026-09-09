@@ -1,0 +1,3 @@
+[submodule "vendor/speex"]
+	path = vendor/speex
+	url = https://github.com/xiph/speex.git

@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DCR converter</title>
+  <link rel="stylesheet" href="./css/app.css">
+</head>
+<body>
+  <main>
+    <h1>DCR converter</h1>
+    <p>
+      Convert a Liberty court recording (<code>.dcr</code>) to WAV on this device.
+      The file is never uploaded; all parsing and decoding run in your browser.
+    </p>
+    <p>
+      <a href="https://github.com/dylancvdean/dcrconverter">Source on GitHub</a>
+    </p>
+
+    <div id="drop" class="drop">
+      <label>
+        Choose a <code>.dcr</code> file
+        <input id="file" type="file" accept=".dcr,application/octet-stream">
+      </label>
+      <span>or drop it here</span>
+    </div>
+
+    <p id="status" role="status"></p>
+    <div id="result" hidden></div>
+  </main>
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
