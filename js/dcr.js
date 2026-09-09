@@ -1,8 +1,11 @@
-/** Liberty / High Criteria DCR reader. All offsets are file-absolute. */
+/** Liberty / High Criteria DCR reader. */
 
 const MAGIC = "HGCRLCRS";
 const CADR_BGN = asciiBytes("cadr#bgn");
 const AUDI_MRK = asciiBytes("audi#mrk");
+const DATA_END = asciiBytes("data#end");
+const SMALL_SECTION_LIMIT = 2 * 1024 * 1024;
+const MATERIALIZE_CAP = 512 * 1024 * 1024;
 
 function asciiBytes(s) {
   const out = new Uint8Array(s.length);
@@ -28,6 +31,18 @@ function indexOfSeq(buf, seq, start = 0) {
   return -1;
 }
 
+function concatBytes(chunks) {
+  let n = 0;
+  for (const c of chunks) n += c.length;
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const c of chunks) {
+    out.set(c, o);
+    o += c.length;
+  }
+  return out;
+}
+
 function u16(view, off) {
   return view.getUint16(off, true);
 }
@@ -50,27 +65,134 @@ async function readSlice(blob, start, length) {
   return new Uint8Array(buf);
 }
 
+function hasMagic(bytes) {
+  return bytes && bytes.length >= 8 && String.fromCharCode(...bytes.subarray(0, 8)) === MAGIC;
+}
+
+function emptyFileError(file) {
+  const reported = typeof file.size === "number" ? file.size : 0;
+  return new Error(
+    `Could not read “${file.name || "this file"}” (browser reported ${reported} bytes). ` +
+      "If it is in iCloud, OneDrive, or Google Drive, wait for it to finish downloading to this device, then choose it again."
+  );
+}
+
+/**
+ * Read the first n bytes even when File.size is 0 (Safari / cloud stubs).
+ * Stream first so a large recording is not forced into RAM.
+ */
+async function readPrefix(file, n) {
+  if (file.size >= n) {
+    const sliced = await readSlice(file, 0, n);
+    if (sliced.length >= n) return { bytes: sliced, via: "slice" };
+  }
+  if (typeof file.stream === "function") {
+    const reader = file.stream().getReader();
+    const chunks = [];
+    let got = 0;
+    try {
+      while (got < n) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const piece = value instanceof Uint8Array ? value : new Uint8Array(value);
+        chunks.push(piece);
+        got += piece.byteLength;
+      }
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {
+        /* ignore */
+      }
+    }
+    if (got >= n) return { bytes: concatBytes(chunks).subarray(0, n), via: "stream" };
+  }
+  const whole = await readWholeCapped(file);
+  if (whole && whole.length >= n) {
+    return { bytes: whole.subarray(0, n), via: "buffer", whole };
+  }
+  return { bytes: new Uint8Array(0), via: "empty" };
+}
+
+function readWholeCapped(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onprogress = (ev) => {
+      if (ev.loaded > MATERIALIZE_CAP) {
+        r.abort();
+        reject(
+          new Error(
+            "This file is too large to load without a real size from the OS. Copy it fully onto the device and try again."
+          )
+        );
+      }
+    };
+    r.onload = () => resolve(new Uint8Array(r.result));
+    r.onerror = () => reject(r.error || new Error("could not read file"));
+    r.onabort = () =>
+      reject(new Error("stopped reading a huge file with no reported size"));
+    try {
+      r.readAsArrayBuffer(file);
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+function fileFromBytes(bytes, original) {
+  const copy = bytes.slice();
+  try {
+    return new File([copy], original.name || "recording.dcr", {
+      type: original.type || "application/octet-stream",
+      lastModified: original.lastModified || Date.now(),
+    });
+  } catch {
+    const blob = new Blob([copy], { type: original.type || "application/octet-stream" });
+    blob.name = original.name || "recording.dcr";
+    return blob;
+  }
+}
+
 export async function peekDcr(file) {
-  if (file.size < 36) throw new Error("file is too small to be a Liberty DCR");
-  const head = await readSlice(file, 0, 16);
-  const magic = String.fromCharCode(...head.subarray(0, 8));
-  if (magic !== MAGIC) {
+  const prefix = await readPrefix(file, 16);
+  if (prefix.via === "buffer" && prefix.whole) {
+    file = fileFromBytes(prefix.whole, file);
+  }
+  if (!hasMagic(prefix.bytes)) {
+    if (prefix.via === "empty" || prefix.bytes.length < 8) throw emptyFileError(file);
     throw new Error("not a Liberty DCR file (missing HGCRLCRS header)");
   }
+
+  let info = null;
+  if (file.size >= 36 && prefix.via === "slice") {
+    try {
+      info = await peekFromTrailer(file);
+    } catch {
+      info = null;
+    }
+  }
+  if (!info) info = await peekByScan(file);
+
+  info.file = file;
+  info.fileName = file.name || info.fileName || "recording.dcr";
+  if (!info.fileSize) info.fileSize = file.size;
+  return info;
+}
+
+async function peekFromTrailer(file) {
+  const head = await readSlice(file, 0, 16);
   const hv = new DataView(head.buffer, head.byteOffset, head.byteLength);
   const version = u32(hv, 8);
   const flags = u32(hv, 12);
 
   const tail = await readSlice(file, Math.max(0, file.size - 20), 20);
   if (String.fromCharCode(...tail.subarray(0, 4)) !== "head") {
-    throw new Error("could not find DCR trailer (not a Liberty recording?)");
+    throw new Error("no trailer");
   }
   const tv = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
   const trailerOff = u64(tv, 4);
   const trailerSize = u64(tv, 12);
-  if (trailerOff + trailerSize !== file.size) {
-    throw new Error("DCR trailer does not match file size");
-  }
+  if (trailerOff + trailerSize !== file.size) throw new Error("trailer size mismatch");
 
   const trailer = await readSlice(file, trailerOff, trailerSize);
   const sections = [];
@@ -86,36 +208,79 @@ export async function peekDcr(file) {
     });
     i += 24;
   }
+  return finishPeek(file, version, flags, sections, false);
+}
 
+async function peekByScan(file) {
+  const cur = await openCursor(file, 0, file.size > 0 ? file.size : Infinity);
+  await cur.fill(16);
+  if (cur.buffered() < 16) throw emptyFileError(file);
+  const head = cur.consume(16);
+  if (!hasMagic(head)) throw new Error("not a Liberty DCR file (missing HGCRLCRS header)");
+  const hv = new DataView(head.buffer, head.byteOffset, head.byteLength);
+  const version = u32(hv, 8);
+  const flags = u32(hv, 12);
+  const sections = [];
+
+  while (!cur.eof) {
+    await cur.fill(8);
+    if (cur.buffered() < 8) break;
+    const tag = String.fromCharCode(...cur.buf.subarray(0, 8));
+    if (tag.slice(4) !== "#bgn" || !/^[A-Za-z]{4}$/.test(tag.slice(0, 4))) break;
+    const name = tag.slice(0, 4);
+    const start = cur.start;
+    cur.consume(8);
+    const endTag = asciiBytes(name + "#end");
+    if (name === "data") {
+      sections.push({ name, index: 0, offset: start, size: 0, unbounded: true });
+      break;
+    }
+    const payload = await readUntilTag(cur, endTag, SMALL_SECTION_LIMIT);
+    sections.push({
+      name,
+      index: 0,
+      offset: start,
+      size: 8 + payload.length + 8,
+      payload,
+    });
+  }
+
+  return finishPeek(file, version, flags, sections, true);
+}
+
+async function finishPeek(file, version, flags, sections, scanned) {
   const wfmtSec = sections.find((s) => s.name === "wfmt");
   const dataSec = sections.find((s) => s.name === "data");
   if (!wfmtSec || !dataSec) throw new Error("file is missing audio (wfmt/data) sections");
 
-  const wfmtRaw = await readSlice(file, wfmtSec.offset, wfmtSec.size);
-  const wfx = parseWfx(payloadOf(wfmtRaw, "wfmt"));
+  const wfmtRaw = wfmtSec.payload
+    ? tagged(wfmtSec.payload, "wfmt")
+    : payloadOf(await readSlice(file, wfmtSec.offset, wfmtSec.size), "wfmt");
+  const wfx = parseWfx(wfmtRaw);
 
   let metaText = "";
   const metaSec = sections.find((s) => s.name === "meta");
   if (metaSec) {
-    const raw = await readSlice(file, metaSec.offset, metaSec.size);
-    metaText = xmlPayload(payloadOf(raw, "meta"));
+    const raw = metaSec.payload
+      ? tagged(metaSec.payload, "meta")
+      : payloadOf(await readSlice(file, metaSec.offset, metaSec.size), "meta");
+    metaText = xmlPayload(raw);
   }
 
   let rinfText = "";
   const rinfSec = sections.find((s) => s.name === "rinf");
   if (rinfSec) {
-    const raw = await readSlice(file, rinfSec.offset, rinfSec.size);
-    rinfText = xmlPayload(payloadOf(raw, "rinf"));
+    const raw = rinfSec.payload
+      ? tagged(rinfSec.payload, "rinf")
+      : payloadOf(await readSlice(file, rinfSec.offset, rinfSec.size), "rinf");
+    rinfText = xmlPayload(raw);
   }
 
   const channelNames = parseChannelNames(rinfText);
   const nAudio = wfx.nChannels || 1;
   const channels = [];
   for (let c = 0; c < nAudio; c++) {
-    channels.push({
-      index: c,
-      name: channelNames[c] || `Channel ${c + 1}`,
-    });
+    channels.push({ index: c, name: channelNames[c] || `Channel ${c + 1}` });
   }
 
   return {
@@ -126,11 +291,16 @@ export async function peekDcr(file) {
     sections,
     wfx,
     data: dataSec,
+    scanned,
     appName: cdata(metaText, "NAMEAPP") || "Liberty",
     created: cdata(metaText, "TIMECR"),
     channels,
     videoCount: sections.filter((s) => s.name === "vdeo").length,
   };
+}
+
+function tagged(payload, name) {
+  return payload;
 }
 
 function payloadOf(sectionBytes, name) {
@@ -147,10 +317,14 @@ function payloadOf(sectionBytes, name) {
 }
 
 function parseWfx(payload) {
-  const body = payload.length >= 22 && payload[0] === 0 && payload[1] === 0
-    && payload[2] === 0 && payload[3] === 0
-    ? payload.subarray(4)
-    : payload;
+  const body =
+    payload.length >= 22 &&
+    payload[0] === 0 &&
+    payload[1] === 0 &&
+    payload[2] === 0 &&
+    payload[3] === 0
+      ? payload.subarray(4)
+      : payload;
   const dv = new DataView(body.buffer, body.byteOffset, body.byteLength);
   const wFormatTag = u16(dv, 0);
   const nChannels = u16(dv, 2);
@@ -209,12 +383,24 @@ function parseChannelNames(xml) {
   return names;
 }
 
-class Cursor {
+class BlobCursor {
   constructor(blob, start, end) {
     this.blob = blob;
     this.pos = start;
     this.end = end;
     this.buf = new Uint8Array(0);
+  }
+
+  get start() {
+    return this.pos - this.buf.length;
+  }
+
+  get eof() {
+    return this.buf.length === 0 && this.pos >= this.end;
+  }
+
+  get sourceDrained() {
+    return this.pos >= this.end;
   }
 
   buffered() {
@@ -251,20 +437,129 @@ class Cursor {
   }
 }
 
-/**
- * Yield packed Speex frames. Video `cadr` chunks are skipped by advancing
- * the file cursor so their bodies are never loaded.
- *
- * `audi#mrk` tokens are real bookmarks only in video recordings (they sit on
- * Speex frame boundaries in the gaps around `cadr`). Audio-only files can
- * contain the same eight bytes inside the bitstream, so we must not strip
- * them there.
- */
-export async function* iterateSpeexFrames(file, dataSection, blockAlign, options = {}) {
-  const stripAudiMarkers = Boolean(options.stripAudiMarkers);
-  const payloadStart = dataSection.offset + 8;
-  const payloadEnd = dataSection.offset + dataSection.size - 8;
-  const cur = new Cursor(file, payloadStart, payloadEnd);
+class StreamCursor {
+  constructor(stream) {
+    this.reader = stream.getReader();
+    this.buf = new Uint8Array(0);
+    this.consumed = 0;
+    this.done = false;
+    this.end = Infinity;
+  }
+
+  get start() {
+    return this.consumed;
+  }
+
+  get pos() {
+    return this.consumed + this.buf.length;
+  }
+
+  get eof() {
+    return this.buf.length === 0 && this.done;
+  }
+
+  get sourceDrained() {
+    return this.done;
+  }
+
+  buffered() {
+    return this.buf.length;
+  }
+
+  async pull() {
+    if (this.done) return;
+    const { done, value } = await this.reader.read();
+    if (done) {
+      this.done = true;
+      return;
+    }
+    const piece = value instanceof Uint8Array ? value : new Uint8Array(value);
+    const next = new Uint8Array(this.buf.length + piece.length);
+    next.set(this.buf, 0);
+    next.set(piece, this.buf.length);
+    this.buf = next;
+  }
+
+  async fill(n) {
+    while (this.buf.length < n && !this.done) await this.pull();
+  }
+
+  async skip(n) {
+    if (n <= this.buf.length) {
+      this.buf = this.buf.subarray(n);
+      this.consumed += n;
+      return;
+    }
+    n -= this.buf.length;
+    this.consumed += this.buf.length;
+    this.buf = new Uint8Array(0);
+    while (n > 0 && !this.done) {
+      const { done, value } = await this.reader.read();
+      if (done) {
+        this.done = true;
+        return;
+      }
+      const piece = value instanceof Uint8Array ? value : new Uint8Array(value);
+      if (piece.length <= n) {
+        n -= piece.length;
+        this.consumed += piece.length;
+      } else {
+        this.buf = piece.subarray(n);
+        this.consumed += n;
+        n = 0;
+      }
+    }
+  }
+
+  consume(n) {
+    const out = this.buf.subarray(0, n);
+    this.buf = this.buf.subarray(n);
+    this.consumed += n;
+    return out;
+  }
+}
+
+async function openCursor(file, start, end) {
+  const canSeek = file.size > 0 && end !== Infinity && file.size >= Math.min(end, start + 1);
+  if (canSeek && start < file.size) {
+    return new BlobCursor(file, start, end);
+  }
+  if (typeof file.stream !== "function") throw emptyFileError(file);
+  const cur = new StreamCursor(file.stream());
+  if (start) await cur.skip(start);
+  return cur;
+}
+
+async function readUntilTag(cur, endTag, limit) {
+  const chunks = [];
+  let total = 0;
+  while (!cur.eof) {
+    await cur.fill(endTag.length);
+    if (cur.buffered() < endTag.length) break;
+    const hit = indexOfSeq(cur.buf, endTag);
+    if (hit >= 0) {
+      if (hit) {
+        chunks.push(cur.consume(hit).slice());
+        total += hit;
+      }
+      cur.consume(endTag.length);
+      return concatBytes(chunks);
+    }
+    const keep = endTag.length - 1;
+    const take = cur.buffered() - keep;
+    if (take > 0) {
+      chunks.push(cur.consume(take).slice());
+      total += take;
+      if (total > limit) throw new Error("DCR section is larger than expected");
+    } else {
+      await cur.fill(cur.buffered() + 64 * 1024);
+      if (cur.eof) break;
+    }
+  }
+  throw new Error("unclosed DCR section");
+}
+
+async function* iterateFromCursor(cur, blockAlign, stripAudiMarkers, unbounded) {
   await cur.fill(4);
   if (cur.buffered() >= 4) cur.consume(4);
 
@@ -287,9 +582,11 @@ export async function* iterateSpeexFrames(file, dataSection, blockAlign, options
     return frames;
   };
 
-  while (cur.pos < cur.end || cur.buffered() > 0) {
+  while (!cur.eof || cur.buffered() > 0) {
     await cur.fill(12);
     if (cur.buffered() === 0) break;
+
+    if (unbounded && cur.buffered() >= 8 && startsWith(cur.buf, DATA_END)) break;
 
     if (cur.buffered() >= 8 && startsWith(cur.buf, CADR_BGN)) {
       await cur.fill(12);
@@ -308,20 +605,28 @@ export async function* iterateSpeexFrames(file, dataSection, blockAlign, options
 
     const cadrAt = indexOfSeq(cur.buf, CADR_BGN);
     const audiAt = stripAudiMarkers ? indexOfSeq(cur.buf, AUDI_MRK) : -1;
+    const dataEndAt = unbounded ? indexOfSeq(cur.buf, DATA_END) : -1;
     let cut = cur.buf.length;
     if (cadrAt >= 0) cut = Math.min(cut, cadrAt);
     if (audiAt >= 0) cut = Math.min(cut, audiAt);
+    if (dataEndAt >= 0) cut = Math.min(cut, dataEndAt);
 
     if (cut === cur.buf.length) {
       const keep = Math.min(7, cur.buf.length);
       const take = cur.buf.length - keep;
       if (take <= 0) {
-        if (cur.pos >= cur.end) {
+        if (cur.eof || cur.sourceDrained) {
           const frames = emitFrom(cur.consume(cur.buffered()));
           for (const f of frames) yield f;
           break;
         }
+        const before = cur.buffered();
         await cur.fill(cur.buffered() + 64 * 1024);
+        if (cur.buffered() <= before) {
+          const frames = emitFrom(cur.consume(cur.buffered()));
+          for (const f of frames) yield f;
+          break;
+        }
         continue;
       }
       const frames = emitFrom(cur.consume(take));
@@ -339,6 +644,22 @@ export async function* iterateSpeexFrames(file, dataSection, blockAlign, options
     const frames = emitFrom(new Uint8Array(0));
     for (const f of frames) yield f;
   }
+}
+
+/**
+ * Yield packed Speex frames. Video `cadr` chunks are skipped without keeping
+ * their bodies. If File.size is missing, the file is read as a stream so the
+ * OS can hydrate iCloud/OneDrive/iOS placeholders.
+ */
+export async function* iterateSpeexFrames(file, dataSection, blockAlign, options = {}) {
+  const stripAudiMarkers = Boolean(options.stripAudiMarkers);
+  const unbounded = Boolean(dataSection.unbounded);
+  const payloadStart = dataSection.offset + 8;
+  const payloadEnd = unbounded
+    ? (file.size > payloadStart ? file.size : Infinity)
+    : dataSection.offset + dataSection.size - 8;
+  const cur = await openCursor(file, payloadStart, payloadEnd);
+  yield* iterateFromCursor(cur, blockAlign, stripAudiMarkers, unbounded);
 }
 
 export function wavHeader(sampleRate, nChannels, dataBytes) {

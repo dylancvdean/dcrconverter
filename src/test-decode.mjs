@@ -14,10 +14,21 @@ const { instance } = await WebAssembly.instantiate(wasmBytes, {
   },
 });
 
-async function convert(path) {
+async function convert(path, { lieSize } = {}) {
   const buf = await readFile(path);
-  const file = new Blob([buf], { type: "application/octet-stream" });
+  let file = new Blob([buf], { type: "application/octet-stream" });
   file.name = path.split("/").pop();
+  if (lieSize) {
+    const inner = file;
+    file = new Proxy(inner, {
+      get(target, prop) {
+        if (prop === "size") return 0;
+        const v = target[prop];
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+    file.name = path.split("/").pop();
+  }
   const info = await peekDcr(file);
   const decoder = await SpeexDecoder.create(info.wfx.nSamplesPerSec, instance);
   const pcmParts = [];
@@ -62,6 +73,7 @@ for (const f of files) {
       seconds: +(r.frames * 0.02).toFixed(2),
       pcmBytes: r.pcm.length,
       ms: r.ms,
+      scanned: !!r.info.scanned,
     })
   );
   if (process.env.WRITE_WAV) {
@@ -69,4 +81,17 @@ for (const f of files) {
     writeFileSync(out, r.wav);
     console.log("wrote", out);
   }
+}
+
+const music = "/home/dylan/Projects/dcr/samples/vendor-archive/Music_20120301.dcr";
+if (!process.argv.slice(2).length) {
+  const r = await convert(music, { lieSize: true });
+  console.log(
+    JSON.stringify({
+      lieSize: true,
+      frames: r.frames,
+      seconds: +(r.frames * 0.02).toFixed(2),
+      scanned: !!r.info.scanned,
+    })
+  );
 }

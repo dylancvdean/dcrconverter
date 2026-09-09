@@ -39,10 +39,10 @@ async function loadFile(file) {
   current = null;
   resultEl.hidden = true;
   resultEl.innerHTML = "";
-  setStatus("Reading header…");
+  setStatus("Reading");
   try {
     const info = await peekDcr(file);
-    current = { file, info };
+    current = { file: info.file || file, info };
     setStatus("");
     render(info);
   } catch (err) {
@@ -51,7 +51,9 @@ async function loadFile(file) {
 }
 
 function render(info) {
-  const size = formatBytes(info.fileSize);
+  const size = info.fileSize
+    ? formatBytes(info.fileSize)
+    : "size unknown (streaming)";
   const video = info.videoCount
     ? ` · ${info.videoCount} video stream${info.videoCount === 1 ? "" : "s"} skipped`
     : "";
