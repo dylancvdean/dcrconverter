@@ -62,7 +62,7 @@ function render(info) {
       ${escapeHtml(info.appName)}${info.created ? " · " + escapeHtml(info.created) : ""}<br>
       ${size} · Speex ${info.wfx.nSamplesPerSec / 1000} kHz${video}
     </p>
-    <p class="hint">Each channel is saved as its own WAV so you can play or stream it without unzipping.</p>
+    <p class="hint">Each channel is saved as its own WAV</p>
     <ul class="channels"></ul>
   `;
   const list = resultEl.querySelector(".channels");
