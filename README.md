@@ -1,6 +1,6 @@
 # DCR converter
 
-Browser tool that turns High Criteria Liberty `.dcr` court recordings into ordinary WAV files. **Nothing is uploaded** — parsing and Speex decode run in your browser.
+Browser tool that turns High Criteria Liberty `.dcr` court recordings into ordinary WAV files. Live at [dcrconverter.com](https://dcrconverter.com). **Nothing is uploaded** — parsing and Speex decode run in your browser.
 
 Each audio channel is saved as its own WAV.
 
