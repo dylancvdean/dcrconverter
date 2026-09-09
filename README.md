@@ -22,7 +22,7 @@ Then visit `http://localhost:8080`. You need `clang` with `wasm32` and `lld`. Ch
 
 ## Speex
 
-The decoder is [Speex 1.2.1](https://github.com/xiph/speex/tree/Speex-1.2.1) (BSD), vendored as `vendor/speex`. Glue and the WASM build live in `src/wasm/`. The compiled binary is a build output, not source.
+The decoder is [Speex 1.2.1](https://github.com/xiph/speex/tree/Speex-1.2.1) (BSD), vendored as `vendor/speex`.
 
 ## What it understands
 
